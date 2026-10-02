@@ -1,0 +1,254 @@
+# Restore the assignment's branch structure exactly once, at the moment
+# Classroom50 creates the student repo — then remove ourselves.
+#
+# WHY THIS FILE EXISTS
+# ---------------------
+# Classroom50 (`gh student accept`) creates student repos via GitHub's
+# template-generate endpoint (POST /repos/{owner}/{repo}/generate). That
+# endpoint has two properties that break this assignment:
+#
+#   1. By default only the DEFAULT branch is copied, and it arrives as a single
+#      SQUASHED commit (all template history on `main` is collapsed).
+#   2. With "Include all branches" (classroom50 >= 1.28) the other branches are
+#      copied as INDEPENDENT SQUASHED ROOT commits — no shared ancestor, no
+#      original history, no original commit SHAs.
+#
+# This Git-basics assignment needs the real DAG (shared root `a6172c7`,
+# byte-identical branch SHAs) so students can merge and rebase exactly as the
+# README describes. Classroom50 does not support forking, so none of that
+# survives generation. See
+# https://github.com/foundation50/classroom50/discussions/206
+#
+# THE TRIGGER MODEL (fires once, then disappears)
+# ------------------------------------------------
+# GitHub Actions can only react to events inside the repo the workflow lives
+# in; there is no `on: repository_created` hook to subscribe to from outside.
+# The only reliable trigger that coincides with repo creation is the FIRST push
+# Classroom50 makes while provisioning the repo. That push evaluates the
+# workflow files on the newly generated default branch — so for the trigger to
+# exist at all, this file must live in the template's `main` and therefore
+# necessarily rides along into every generated repo once.
+#
+# It does NOT stay there:
+#
+#   - The rebuild step commits a `main` whose tree deliberately EXCLUDES this
+#     file. After this single run the workflow no longer exists in the student
+#     repo, so nothing can ever trigger it again there. The student is left
+#     with the restored branches, the original history on `main`, and only the
+#     ordinary Classroom50 control files and autograder shim.
+#   - The template repo itself carries the file on `main` too. When the teacher
+#     pushes to the template, the guard below (.classroom50.yaml is Classroom50's
+#     accept-time marker and never exists in the template) makes that run a
+#     no-op — the tool does not touch the template.
+#
+# WHAT THIS WORKFLOW DOES (single run)
+# ------------------------------------
+#   1. Guard: skip unless `.classroom50.yaml` is present (= this is a
+#      Classroom50-generated student repo, not the template).
+#   2. Fetch the SOURCE template repo (full history, all branches, tags).
+#   3. Re-push every non-`main` branch at its ORIGINAL commit SHA.
+#   4. Rebuild `main` as a single-root branch: original template history +
+#      Classroom50's control files on top, WITHOUT this workflow file.
+#   5. If the force-push is rejected by Classroom50's submission-history
+#      ruleset, fall back to a ruleset-safe two-parent graft (current remote
+#      scaffold tip as first parent => ordinary fast-forward) that likewise
+#      excludes this file.
+#
+# Robustness: `main` may advance while this runs — Classroom50 provisioning
+# can push several commits in quick succession, and this workflow can re-fire
+# on the template. Both paths therefore `git fetch origin main` first and
+# anchor on the CURRENT remote tip (never the trigger-time checkout), so the
+# fallback's push is always a fast-forward even if the trigger commit is stale.
+#
+# THE RULESET THAT SHAPED THIS FILE
+# ----------------------------------
+# Teacher-setup installs two org branch rulesets (see web/src/github-core/
+# rulesets.ts in the classroom50 repo):
+#
+#   - classroom50-protect-submission-history: target "~DEFAULT_BRANCH" (main),
+#     rules = [non_fast_forward, deletion], bypass = OrganizationAdmin only.
+#   - classroom50-feedback-base-lock: locks the Feedback-PR base branch.
+#
+# Consequences relevant to the rebuild:
+#
+#   - `main` CANNOT be force-pushed or deleted by this workflow (GITHUB_TOKEN is
+#     not an org-admin bypass). The non-`main` branches are untouched by the
+#     ruleset, so restoring them needs no special permission.
+#   - Rebuilding `main` therefore MUST end in a fast-forward from the scaffold
+#     tip, or use a token that bypasses the ruleset. The preferred clean
+#     single-root rebuild re-applies the Classroom50 control files on TOP of the
+#     original history and pushes with --force, so it needs a bypass-capable
+#     token (an org-admin PAT, secret ORG_ADMIN_PAT; optional). If that secret
+#     is absent and the force-push is rejected, this workflow automatically
+#     falls back to the well-known two-parent graft, which pushes as an ordinary
+#     fast-forward and never hits the ruleset — at the cost of a `main` with two
+#     root commits. The fallback works, but the extra root is confusing in a
+#     Git-basics course, so the clean route (ORG_ADMIN_PAT) is preferred.
+
+name: Restore assignment branches (one-shot, removed after run)
+
+on:
+  push:
+    branches: [main]
+
+# contents: write  -> push restored branches and the rebuilt main
+permissions:
+  contents: write
+
+env:
+  # The repo that holds the REAL multi-branch content. Must be reachable
+  # read-only by this workflow. Public here (nsu-syspro/mpt-git-basics), so no
+  # secret is required; if you ever make it private, add an org secret
+  # SOURCE_READ_PAT (fine-grained, Contents: Read-only, that repo only).
+  SOURCE_REPO: nsu-syspro/mpt-git-basics
+  # Internal branches carried by the source repo that students should not see.
+  EXCLUDE_BRANCHES: "badges test"
+
+concurrency:
+  group: ${{ github.repository }}-restore-branches
+  cancel-in-progress: false
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (Classroom50-generated)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Critical: actions/checkout defaults to persist-credentials: true,
+          # which injects this job's GITHUB_TOKEN as a git credential header
+          # applying to ANY github.com HTTPS request for the rest of the job.
+          # Disable it so the explicit credential setup below is authoritative.
+          persist-credentials: false
+
+      - name: Authenticate origin with GITHUB_TOKEN (or org-admin PAT if given)
+        run: |
+          TOKEN="${{ secrets.ORG_ADMIN_PAT }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ github.token }}"
+          fi
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+
+      - name: Guard — only a Classroom50-generated student repo
+        id: guard
+        run: |
+          # .classroom50.yaml is Classroom50's accept-time marker. The template
+          # repo itself never has one, so pushes to the template's main are a
+          # no-op here. A student repo that already ran this workflow no longer
+          # contains this file on `main`, so it cannot be re-triggered at all.
+          if [ ! -f .classroom50.yaml ]; then
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "Not a Classroom50 repo (.classroom50.yaml missing) — skip."
+            exit 0
+          fi
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "Classroom50-generated repo; restoring full branch structure from ${SOURCE_REPO}."
+
+      - name: Fetch source repo (full history, all branches, tags)
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          READ_TOKEN=""
+          if [ -n "${{ secrets.SOURCE_READ_PAT }}" ]; then
+            READ_TOKEN="x-access-token:${{ secrets.SOURCE_READ_PAT }}@"
+          fi
+          # Idempotent: a run interrupted after this point is healed by the next
+          # main push (the file still exists then), so re-adding the remote must
+          # be harmless.
+          git remote remove source 2>/dev/null || true
+          git remote add source "https://${READ_TOKEN}github.com/${SOURCE_REPO}.git"
+          git fetch source '+refs/heads/*:refs/remotes/source/*' '+refs/tags/*:refs/tags/*'
+
+      - name: Recreate non-main branches at original SHAs (full history)
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/source); do
+            b="${ref#source/}"
+            if [ "$b" = "main" ]; then
+              continue
+            fi
+            case " $EXCLUDE_BRANCHES " in
+              *" $b "*) echo "skip $b (excluded)"; continue ;;
+            esac
+            # Push straight from the fetched ref so SHAs stay byte-identical.
+            # --force covers the case where the teacher left "Include all
+            # branches" on and the generated repo already carries a squashed
+            # copy of the branch under the same name.
+            git push --force origin "refs/remotes/source/$b:refs/heads/$b"
+          done
+          git push origin --tags || true
+
+      - name: Rebuild main — original history + Classroom50 files, minus this workflow
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          SOURCE_MAIN=$(git rev-parse source/main)
+
+          # Main can advance while we work: Classroom50 provisioning can push
+          # several commits in quick succession, and this workflow itself may
+          # re-fire. Always anchor on the CURRENT remote tip, not the commit
+          # that happened to trigger this run, so the fast-forward fallback
+          # below is always valid.
+          git fetch origin main
+          SCAFFOLD_TIP=$(git rev-parse origin/main)
+
+          # Safety: only ever touch a Classroom50 scaffold. If origin/main
+          # points at something else, refuse rather than clobber it.
+          if ! git cat-file -e "${SCAFFOLD_TIP}:.classroom50.yaml" 2>/dev/null; then
+            echo "origin/main is not a Classroom50 scaffold — refusing to touch it."
+            exit 1
+          fi
+
+          # Files Classroom50 landed on the snapshot on top of the template
+          # snapshot (.classroom50.yaml, autograde shim, ...) = paths present in
+          # the scaffold but not in the template's own main. Restore those onto
+          # the ORIGINAL history.
+          CFILES=$(git diff-tree -r --no-commit-id --name-only "$SCAFFOLD_TIP" "$SOURCE_MAIN" \
+            | while read -r f; do
+                if git cat-file -e "$SCAFFOLD_TIP:$f" 2>/dev/null; then
+                  printf '%s ' "$f"
+                fi
+              done)
+
+          # Preferred: clean single-root main. Rebuild on the original history,
+          # overlay Classroom50's files, and DELETE THIS WORKFLOW from the tree
+          # so it can never run again in this repo.
+          git checkout -B __restore_main "$SOURCE_MAIN"
+          if [ -n "$CFILES" ]; then
+            git checkout "$SCAFFOLD_TIP" -- $CFILES
+          fi
+          git rm -q --ignore-unmatch .github/workflows/restore-branches.yml
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -q -m "Re-apply Classroom50 scaffold on full template history (one-shot restore)"
+          fi
+
+          if git push --force origin "__restore_main:refs/heads/main"; then
+            echo "main rebuilt as a single-root branch; this workflow is now gone from the repo."
+            exit 0
+          fi
+
+          echo "Force-push to main rejected (classroom50 protect-submission-history ruleset)."
+          echo "Falling back to a ruleset-safe two-parent graft (also removes this workflow)."
+
+          # Re-fetch: remote main may have advanced again. Anchor the graft's
+          # FIRST parent on the current remote tip so pushing main is an
+          # ordinary fast-forward (the ruleset blocks force, not fast-forward).
+          git fetch origin main
+          SCAFFOLD_TIP=$(git rev-parse origin/main)
+          git cat-file -e "${SCAFFOLD_TIP}:.classroom50.yaml" 2>/dev/null || {
+            echo "origin/main moved to a non-scaffold commit — aborting fallback."
+            exit 1
+          }
+
+          git checkout --detach "$SCAFFOLD_TIP"
+          git rm -q --ignore-unmatch .github/workflows/restore-branches.yml
+          git add -A
+          GRAFT_TREE=$(git write-tree)
+          GRAFT=$(git commit-tree "$GRAFT_TREE" \
+            -p "$SCAFFOLD_TIP" -p "$SOURCE_MAIN" \
+            -m "Merge Classroom50 scaffold with full template history (one-shot restore)")
+          git update-ref refs/heads/main "$GRAFT"
+          git push origin main
